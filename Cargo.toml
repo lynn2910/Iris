@@ -1,0 +1,11 @@
+[workspace]
+members = [ "lana", "lib/client", "lib/structures","lua_test"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = "1.0.201"
+serde_json = "1.0.117"
+
+tokio = "1.37.0"
+smol = "2.0.0"
+tokio-tungstenite = "0.21.0"
