@@ -4,4 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0.202", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+tokio-tungstenite = { workspace = true, features = ["connect", "native-tls", "tokio-native-tls", "handshake", "default"] }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "multipart", "default"] }
+
+tokio = { workspace = true, features = ["full"] }
+smol = { workspace = true }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
+
+chrono = { workspace = true }
+structures = { path = "../structures" }
+
+tracing = { workspace = true }
+
+[features]
+verbose = []

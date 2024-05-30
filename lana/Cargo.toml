@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-client = { path = "../lib/client" }
+client = { path = "../lib/client", features = ["verbose"] }
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { version = "0.3.18", features = ["matchers", "default", "env-filter"] }
+tracing = { workspace = true }
