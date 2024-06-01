@@ -34,7 +34,7 @@ pub struct GatewayResponse {
     /// The event name, if any
     #[serde(rename="t")]
     #[serde(default)]
-    pub name: Option<String>
+    pub event_name: Option<String>
 }
 
 /// Contains the information in Get Gateway,
@@ -51,7 +51,7 @@ pub struct BotGatewayEndpoint {
     pub url: String,
     /// The recommended number of shards to use when connecting
     pub shards: u64,
-    /// The
+    /// The details about the session limits
     pub session_start_limit: SessionStartLimit
 }
 

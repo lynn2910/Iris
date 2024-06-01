@@ -19,6 +19,7 @@ chrono = { workspace = true }
 structures = { path = "../structures" }
 
 tracing = { workspace = true }
+async-trait = "0.1.80"
 
 [features]
 verbose = []

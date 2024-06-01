@@ -8,8 +8,10 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
-use tracing::error;
+use tracing::{error, trace};
 use structures::gateway::{BotGatewayEndpoint, GatewayResponse, HelloWsMessage, IdentityGatewayMessage, IdentityProperties, op_codes, OpCode};
+use crate::client::ShardPool;
+use crate::events::EventHandler;
 use crate::http::RestClient;
 use crate::sharding::heartbeat::HeartbeatSession;
 
@@ -29,6 +31,7 @@ pub enum ShardStatus {
 ///
 /// It contains all threads, tasks and information about the shard
 pub struct Shard {
+    pub shard_id: ShardID,
     /// The heartbeat sessions, contains the heartbeat task and a sender to stop the heartbeat
     heartbeat_session: Option<HeartbeatSession>,
     /// Channel used to send messages
@@ -38,7 +41,8 @@ pub struct Shard {
     /// Contains the HTTP client
     http_client: Arc<RestClient>,
     status: Arc<RwLock<ShardStatus>>,
-    tasks: Option<ShardTasks>
+    tasks: Option<ShardTasks>,
+    event_handler: Arc<dyn EventHandler>
 }
 
 struct ShardTasks {
@@ -53,7 +57,7 @@ pub type ShardMessage = tokio_tungstenite::tungstenite::Message;
 
 
 impl Shard {
-    pub fn new(token: Arc<String>) -> Self {
+    pub fn new(shard_id: ShardID, token: Arc<String>, event_handler: Arc<dyn EventHandler>) -> Self {
         let http_client = Arc::new(RestClient::new(token));
 
         Self {
@@ -62,7 +66,9 @@ impl Shard {
             message_received_channel: None,
             status: Arc::new(RwLock::new(ShardStatus::Disconnected)),
             tasks: None,
-            http_client
+            event_handler,
+            http_client,
+            shard_id
         }
     }
 
@@ -74,15 +80,25 @@ impl Shard {
         serde_json::from_reader(m.into_data().as_slice())
     }
 
-    pub async fn connect(&mut self, gateway: &BotGatewayEndpoint, intents: i64) {
+    fn parse_text_to_gateway_response(m: &str) -> serde_json::Result<GatewayResponse> {
+        serde_json::from_str(m)
+    }
+
+    pub async fn connect(
+        &mut self,
+        gateway: &BotGatewayEndpoint,
+        intents: i64,
+        shard_id: ShardID,
+        shard_pool: ShardPool
+    )
+    {
         let (send_message_tx,            mut send_message_rx           ) = mpsc::unbounded::<ShardMessage>();
         let (send_message_stopper_tx,    mut send_message_stopper_rx   ) = mpsc::channel::<()>(1);
-        let (receive_message_tx,             receive_message_rx        ) = mpsc::unbounded::<GatewayResponse>();
+        let (_receive_message_tx,            receive_message_rx        ) = mpsc::unbounded::<GatewayResponse>();
         let (receive_message_stopper_tx, mut receive_message_stopper_rx) = mpsc::channel::<()>(1);
 
         self.message_received_channel = Some(receive_message_rx);
         self.message_sender_channel = Some(send_message_tx.clone());
-
 
         *self.status.write().await = ShardStatus::Connecting;
 
@@ -152,7 +168,6 @@ impl Shard {
         }
 
         // The identity payload has been sent, we must create the tasks which will receive and send messages :o
-
         let status_cl = self.status.clone();
         let send_message_to_shard_task = tokio::spawn(async move {
             loop {
@@ -176,37 +191,78 @@ impl Shard {
         });
 
         let status_cl = self.status.clone();
+        let events_cl = self.event_handler.clone();
         let receive_message_from_shard_task = tokio::spawn(async move {
-            loop {
+            'receiver_loop: loop {
                 tokio::select! {
                     _ = receive_message_stopper_rx.next() => {
                         receive_message_stopper_rx.close();
                         break;
                     }
                     Some(msg_received) = ws_read.next() => {
-                        println!("Message received: {msg_received:#?}");
-
-                        if msg_received.is_err() {}
+                        if msg_received.is_err() {
+                            match msg_received.err().unwrap() {
+                                tokio_tungstenite::tungstenite::Error::ConnectionClosed => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "The connection had been closed normally.");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                },
+                                tokio_tungstenite::tungstenite::Error::AlreadyClosed => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "Cannot work with a closed connection.");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                },
+                                tokio_tungstenite::tungstenite::Error::AttackAttempt => {
+                                    panic!("Attack attempt on a shard's websocket detected.");
+                                }
+                                tokio_tungstenite::tungstenite::Error::Utf8 => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "Wrong text encoding received from the websocket, wtf?");
+                                }
+                                tokio_tungstenite::tungstenite::Error::Io(err) => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "IO error from the shard's websocket: {err:#?}");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                }
+                                tokio_tungstenite::tungstenite::Error::Tls(err) => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "TLS error from the shard's websocket: {err:#?}");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                }
+                                tokio_tungstenite::tungstenite::Error::Capacity(err) => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "Websocket buffer capacity exhausted: {err:#?}");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                }
+                                tokio_tungstenite::tungstenite::Error::WriteBufferFull(err) => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "Shard's websocket writing buffer full: {err:#?}");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                }
+                                tokio_tungstenite::tungstenite::Error::Protocol(err) => {
+                                    error!(target: "iris::sharding::shard::ws_receiver", "Protocol error from Discord's websocket: {err:#?}");
+                                    *status_cl.write().await = ShardStatus::Disconnected;
+                                    break 'receiver_loop;
+                                }
+                                _ => unimplemented!("An error was fired in the websocket shard receiver which should not be fired...")
+                            }
+                            return;
+                        }
                         let msg_received = msg_received.unwrap();
 
-                        if !msg_received.is_text() {
-                            println!("Not a text.");
-                            continue;
-                        }
+                        match msg_received {
+                            ShardMessage::Text(t) => Self::text_message_received(t, shard_id, &shard_pool, &events_cl).await,
+                            ShardMessage::Ping(ping) => Self::ping_received(ping).await,
+                            ShardMessage::Pong(pong) => Self::pong_received(pong).await,
+                            ShardMessage::Close(closed) => {
+                                trace!(target: "iris::sharding::shard::ws_receiver", "Close instruction received from the websocket");
+                                if let Some(reason) = closed {
+                                    trace!(target: "iris::sharding::shard::ws_receiver", "Code:   {}", reason.code);
+                                    trace!(target: "iris::sharding::shard::ws_receiver", "Reason: {}", reason.reason);
+                                }
 
-                        let msg = match serde_json::from_str(msg_received.into_text().unwrap().as_str()) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                error!(target: "ShardReceiver", "Invalid message received by the shard: {e:?}");
-                                continue;
+                                *status_cl.write().await = ShardStatus::Disconnected;
                             }
-                        };
-
-                        if let Err(e) = receive_message_tx.unbounded_send(msg) {
-                            error!(target: "ShardReceiver", "Cannot broadcast the message received by the shard: {e:?}");
-                            receive_message_stopper_rx.close();
-                            *status_cl.write().await = ShardStatus::Disconnected;
-                            break;
+                            _ => unimplemented!()
                         }
                     }
                 }
@@ -221,6 +277,31 @@ impl Shard {
             message_receiver_stop_signal: receive_message_stopper_tx,
         });
         *self.status.write().await = ShardStatus::Connected;
+    }
+
+    async fn text_message_received(msg: String, shard_id: ShardID, shard_pool: &ShardPool, events: &Arc<dyn EventHandler>){
+        let gateway_response = match Self::parse_text_to_gateway_response(msg.as_str()) {
+            Ok(gr) => gr,
+            Err(e) => {
+                error!(target: "iris::sharding::shard", "Cannot parse the websocket's message to a GatewayResponse: {e:#?}");
+                return;
+            }
+        };
+
+        if gateway_response.event_name.is_some() {
+            match gateway_response.event_name.as_ref().unwrap().as_str() {
+                manage_events::READY_EVENT_NAME => manage_events::ready_event(shard_pool, shard_id, gateway_response, events).await,
+                event_name => {
+                    trace!(target: "iris::sharding::shard", "Unknown event name: {event_name:?}")
+                }
+            }
+        }
+    }
+    async fn ping_received(_ping: Vec<u8>){
+        println!("Ping received");
+    }
+    async fn pong_received(_ping: Vec<u8>){
+        println!("Pong received");
     }
 
     pub async fn close_shard(&mut self){
@@ -284,5 +365,40 @@ impl Shard {
 
     pub async fn is_connected(&self) -> bool {
         self.get_status().await == ShardStatus::Connected
+    }
+}
+
+mod manage_events {
+    use std::sync::Arc;
+    use tracing::error;
+    use structures::gateway::GatewayResponse;
+    use crate::client::ShardPool;
+    use crate::events::{Context, EventHandler};
+    use crate::sharding::shard::{Shard, ShardID};
+
+    pub(super) const READY_EVENT_NAME: &str = "READY";
+    pub(super) async fn ready_event(
+        shard_pool: &ShardPool,
+        shard_id: ShardID,
+        data: GatewayResponse,
+        events: &Arc<dyn EventHandler>
+    )
+    {
+        let ctx = Context {
+            shard_pool: shard_pool.clone(),
+            shard_id
+        };
+        let events_cl = events.clone();
+        
+        tokio::task::spawn(async move {
+            let parsed_data = Shard::parse_message(data);
+            
+            if let Err(e) = parsed_data {
+                error!(target: "iris::sharding::shard::manage_events", "Invalid object given to the READY event: {e:#?}");
+                return;
+            }
+            
+            events_cl.ready(ctx, parsed_data.unwrap());
+        });
     }
 }

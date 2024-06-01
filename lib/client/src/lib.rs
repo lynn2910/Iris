@@ -1,6 +1,12 @@
 mod sharding;
 pub mod client;
 mod http;
+mod cache;
+pub mod events;
+
+pub mod structures {
+    pub use structures::*;
+}
 
 
 pub const API_URL: &str = "https://discord.com/api/v10/";

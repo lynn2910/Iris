@@ -5,8 +5,11 @@ use reqwest::Method;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, trace};
 use structures::gateway::BotGatewayEndpoint;
+use crate::events::EventHandler;
 use crate::http::{HttpRequestBuilder, RestClient};
 use crate::sharding::shard::{Shard, ShardID};
+
+pub type ShardPool = Arc<RwLock<HashMap<ShardID, Shard>>>;
 
 /// The Discord Client
 ///
@@ -15,7 +18,7 @@ pub struct Client {
     /// The token of the app
     token: Arc<String>,
     /// Contain all shards, stored by their ids
-    shard_pool: Arc<RwLock<HashMap<ShardID, Shard>>>,
+    shard_pool: ShardPool,
     /// Whether the "stop" instruction has been called. If this is false, the client will always try to restart the shards.
     is_closed: Arc<Mutex<bool>>,
     /// The number of shards
@@ -24,11 +27,13 @@ pub struct Client {
     ///
     /// Please note that each shard has his own http client to offer a better multitasking
     global_http_client: RestClient,
+    /// The event handler
+    event_handler: Arc<dyn EventHandler>
 }
 
 impl Client {
     /// Create a new client
-    pub fn new(token: impl Into<String>) -> Self {
+    pub fn new<H: EventHandler + 'static>(token: impl Into<String>, event_handler: H) -> Self {
         let token = Arc::new(token.into());
 
         Self {
@@ -36,6 +41,7 @@ impl Client {
             shard_pool: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(Mutex::new(false)),
             shards_count: 0,
+            event_handler: Arc::new(event_handler),
             token
         }
     }
@@ -49,6 +55,14 @@ impl Client {
 
     pub(crate) fn get_token_copy(&self) -> Arc<String> {
         self.token.clone()
+    }
+
+    pub(crate) fn get_event_handler_copy(&self) -> Arc<dyn EventHandler> {
+        self.event_handler.clone()
+    }
+
+    pub(crate) fn get_shard_pool_clone(&self) -> ShardPool {
+        self.shard_pool.clone()
     }
 }
 
@@ -88,7 +102,14 @@ async fn connect_client(client: Client, intents: i64){
 
     // Create the given number of shards
     for i in 0..client_informations.shards {
-        shard_pool.insert(i, Shard::new(client.get_token_copy()));
+        shard_pool.insert(
+            i,
+            Shard::new(
+                i,
+                client.get_token_copy(),
+                client.get_event_handler_copy()
+            )
+        );
     }
     drop(shard_pool);
 
@@ -107,7 +128,7 @@ async fn connect_client(client: Client, intents: i64){
                 shard.close_shard().await;
 
                 // then, connect again the shard
-                shard.connect(&client_informations, intents).await;
+                shard.connect(&client_informations, intents, *k, client.get_shard_pool_clone()).await;
                 trace!(target: "iris::client", "Shard {k} is connected");
             } else if is_client_closed && is_connected {
                 trace!(target: "iris::client", "Client closed; the shard {k} received the signal.");
